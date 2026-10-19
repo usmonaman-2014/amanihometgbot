@@ -169,6 +169,8 @@ async def init_db():
             "ALTER TABLE work_types ADD COLUMN kind TEXT DEFAULT 'cut'",
             "ALTER TABLE products ADD COLUMN pending INTEGER DEFAULT 0",
             "ALTER TABLE products ADD COLUMN made_by INTEGER",
+            "ALTER TABLE work_types ADD COLUMN fields TEXT",
+            "ALTER TABLE work_logs ADD COLUMN material_name TEXT",
         ):
             try:  # eski bazalar uchun
                 await db.execute(stmt)
@@ -185,6 +187,10 @@ async def init_db():
         if not await cur.fetchone():  # "tikish" nomli ishlar tayyor mahsulot chiqaradigan turga o'tadi
             await db.execute("UPDATE work_types SET kind='make' WHERE lower(name) LIKE '%tik%'")
             await db.execute("INSERT INTO settings(key,value) VALUES('wt_kind_fix','1')")
+        await db.execute(  # eski "tur" asosida so'raladigan ma'lumotlar belgilanadi (faqat bo'sh bo'lsa)
+            "UPDATE work_types SET fields=CASE kind WHEN 'make' THEN 'what,size,name,photo' "
+            "WHEN 'simple' THEN '' ELSE 'material' END WHERE fields IS NULL"
+        )
         for k, v in DEFAULT_PASSWORDS.items():
             await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
         await db.commit()
@@ -399,20 +405,19 @@ class AddWorker(StatesGroup):
 class AddWorkType(StatesGroup):
     name = State()
     price = State()
-    kind = State()
+
+
+class WTFields(StatesGroup):
+    pick = State()
 
 
 class SetWorkPrice(StatesGroup):
     price = State()
 
 
-class LogWork(StatesGroup):
+class Work(StatesGroup):
     pick = State()
     used = State()
-    qty = State()
-
-
-class MakeWork(StatesGroup):
     what = State()
     size = State()
     name = State()
@@ -525,7 +530,8 @@ async def breakdown_by(wid: int, cond: str, params: tuple, title: str) -> str:
     head = f"👷 {w['name'] if w else '—'}\n{title}\n\n"
     rows = await db_all(
         "SELECT work_name, COALESCE(product_name,'') AS product_name, price, SUM(qty) q, "
-        "COALESCE(SUM(used),0) AS used, COALESCE(MAX(used_unit),'') AS used_unit FROM work_logs "
+        "COALESCE(SUM(used),0) AS used, COALESCE(MAX(used_unit),'') AS used_unit, "
+        "COALESCE(MAX(material_name),'') AS material_name FROM work_logs "
         f"WHERE worker_id=? AND {cond} GROUP BY work_name, product_name, price ORDER BY work_name, product_name",
         (wid, *params),
     )
@@ -536,7 +542,10 @@ async def breakdown_by(wid: int, cond: str, params: tuple, title: str) -> str:
         s_ = r["q"] * r["price"]
         total += s_
         what = f"{r['work_name']} — {r['product_name']}" if r["product_name"] else r["work_name"]
-        extra = f" (material: {fmt(r['used'])} {r['used_unit']})" if r["used"] else ""
+        extra = ""
+        if r["used"]:
+            mat = f"{r['material_name']}, " if r["material_name"] and r["material_name"] != r["product_name"] else ""
+            extra = f" (material: {mat}{fmt(r['used'])} {r['used_unit']})"
         lines.append(f"• {what}: {fmt(r['q'])} ta × {money(r['price'])} = {money(s_)} so'm{extra}")
     return head + "\n".join(lines) + f"\n\n💰 Jami oylik: {money(total)} so'm"
 
@@ -598,56 +607,107 @@ async def worker_log(m: Message, state: FSMContext):
     await m.answer("Qaysi ishni qildingiz?", reply_markup=markup(kb))
 
 
+# ---- ish turi uchun so'raladigan ma'lumotlar (menejer belgilaydi)
+FIELD_ORDER = ["material", "what", "size", "name", "photo"]
+FIELD_LABELS = [
+    ("material", "🧵 Material va necha metr ketgani"),
+    ("what", "📦 Nima tayyorlandi (qo'lda yozadi)"),
+    ("size", "👥 Necha kishilik (1 yoki 2)"),
+    ("name", "🏷 Mahsulot nomi"),
+    ("photo", "📷 Rasm (majburiy emas)"),
+]
+FIELD_ICON = {"material": "🧵", "what": "📦", "size": "👥", "name": "🏷", "photo": "📷"}
+
+
+def parse_fields(raw, kind=None):
+    if raw is None:  # eski ish turlari
+        raw = {"make": "what,size,name,photo", "simple": ""}.get(kind, "material")
+    parts = raw.split(",")
+    return [f for f in FIELD_ORDER if f in parts]
+
+
+def toggle_field(fields, key):
+    f = list(fields)
+    if key in f:
+        f.remove(key)
+        if key == "what":  # nima tayyorlanganini so'ramasak, kishilik/nom/rasm ma'nosiz
+            f = [x for x in f if x not in ("size", "name", "photo")]
+    else:
+        f.append(key)
+        if key in ("size", "name", "photo") and "what" not in f:
+            f.append("what")
+    return [x for x in FIELD_ORDER if x in f]
+
+
 async def log_cats_kb():
     rows = await db_all("SELECT id, name FROM categories ORDER BY name")
     return grid([btn(r["name"], f"wlc:{r['id']}") for r in rows])
 
 
-async def save_log(wid, t, p, qty, used=0.0, made_pid=None, pname=None):
-    """Material ayirish va yozuvni bitta tranzaksiyada saqlaydi. Material yetmasa False."""
-    now = datetime.now(TZ)
-    async with aiosqlite.connect(DB) as db:
-        if used and p:
-            cur = await db.execute(
-                "UPDATE products SET quantity=quantity-? WHERE id=? AND quantity>=?", (used, p["id"], used)
-            )
-            if cur.rowcount == 0:
-                return False
-        await db.execute(
-            "INSERT INTO work_logs(worker_id, work_type_id, work_name, product_id, product_name, qty, price, "
-            "day, month, used, used_unit, made_product_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                wid, t["id"], t["name"], p["id"] if p else None, pname or (p["name"] if p else None), qty,
-                t["price"], now.strftime("%Y-%m-%d"), now.strftime("%Y-%m"),
-                used if (used and p) else 0, p["unit"] if (used and p) else None, made_pid,
-            ),
-        )
-        await db.commit()
-    return True
+def target_msg(target):
+    return target.message if isinstance(target, CallbackQuery) else target
+
+
+async def say(target, text, kb=None):
+    if isinstance(target, CallbackQuery):
+        await edit(target, text, kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+STEPS = ["material", "what", "size", "name", "qty", "photo"]
+
+
+async def next_step(target, state: FSMContext, after=None):
+    """Ish turida belgilangan ma'lumotlarni ketma-ket so'raydi, oxirida saqlaydi."""
+    d = await state.get_data()
+    fields = d["fields"]
+    t = await db_one("SELECT name FROM work_types WHERE id=?", (d["tid"],))
+    start = STEPS.index(after) + 1 if after else 0
+    for step in STEPS[start:]:
+        if step != "qty" and step not in fields:
+            continue
+        if step == "material":
+            kb = await log_cats_kb()
+            if not kb:  # omborda hali material yo'q bo'lsa, bu qadam o'tkazib yuboriladi
+                continue
+            await state.set_state(Work.pick)
+            await say(target, f"«{t['name']}» — qaysi materialdan? Bo'limni tanlang:", markup(kb))
+            return
+        if step == "what":
+            await state.set_state(Work.what)
+            await say(target, f"«{t['name']}» — nima tayyorladingiz? Qo'lda yozing (masalan: postel):")
+            return
+        if step == "size":
+            await state.set_state(Work.size)
+            kb = [[btn("1 kishilik", "mksize:1"), btn("2 kishilik", "mksize:2")]]
+            await say(target, f"«{d.get('what', '')}» necha kishilik?", markup(kb))
+            return
+        if step == "name":
+            await state.set_state(Work.name)
+            await say(target, f"{d.get('what', '').capitalize()} — nomini yozing (masalan: Anor):")
+            return
+        if step == "qty":
+            await state.set_state(Work.qty)
+            await say(target, "Nechta (dona) qildingiz? (oylik shu songa qarab hisoblanadi)")
+            return
+        if step == "photo":
+            await state.set_state(Work.photo)
+            kb = [[btn("⏭ Rasmsiz davom etish", "mkskip")]]
+            await say(target, "📷 Tayyor mahsulot rasmini yuboring (majburiy emas):", markup(kb))
+            return
+    await finish_work(target_msg(target), state)
 
 
 @router.callback_query(RoleFilter("worker"), F.data.startswith("wlog:"))
 async def worker_log_pick(c: CallbackQuery, state: FSMContext):
-    t = await db_one("SELECT id, name, kind FROM work_types WHERE id=?", (int(c.data.split(":")[1]),))
+    t = await db_one("SELECT id, name, kind, fields FROM work_types WHERE id=?", (int(c.data.split(":")[1]),))
     if not t:
         return await c.answer("Topilmadi", show_alert=True)
-    kind = t["kind"] or "cut"
-    await state.update_data(tid=t["id"], pid=None, used=0)
-    if kind == "make":  # tikish: nima tayyorlandi
-        await state.set_state(MakeWork.what)
-        await edit(c, f"«{t['name']}» — nima tayyorladingiz? Qo'lda yozing (masalan: postel):")
-        return
-    if kind == "simple":
-        await state.set_state(LogWork.qty)
-        await edit(c, f"«{t['name']}» — nechta qildingiz? (son yozing)")
-        return
-    kb = await log_cats_kb()  # bichish: qaysi materialdan, necha metr ketdi
-    if not kb:  # omborda hali material yo'q bo'lsa, materialsiz kiritiladi
-        await state.set_state(LogWork.qty)
-        await edit(c, f"«{t['name']}» — nechta qildingiz? (son yozing)")
-        return
-    await state.set_state(LogWork.pick)
-    await edit(c, f"«{t['name']}» — qaysi materialdan? Bo'limni tanlang:", markup(kb))
+    wid = await get_worker_id(c.from_user.id)
+    await state.clear()
+    await state.update_data(wid=wid, tid=t["id"], fields=parse_fields(t["fields"], t["kind"]), pid=None, used=0)
+    await next_step(c, state)
 
 
 @router.callback_query(RoleFilter("worker"), F.data == "wlcats")
@@ -675,7 +735,7 @@ async def worker_log_product(c: CallbackQuery, state: FSMContext):
     if not t or not p:
         return await c.answer("Qaytadan boshlang (➕ Ish kiritish)", show_alert=True)
     await state.update_data(pid=p["id"])
-    await state.set_state(LogWork.used)
+    await state.set_state(Work.used)
     await edit(
         c,
         f"«{t['name']}» — «{p['name']}» dan necha {p['unit']} material ketdi?\n"
@@ -683,8 +743,8 @@ async def worker_log_product(c: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(LogWork.used, F.text)
-async def worker_log_used(m: Message, state: FSMContext):
+@router.message(Work.used, F.text)
+async def work_used(m: Message, state: FSMContext):
     used, _ = parse_qty(m.text)
     if used is None or used <= 0:
         await m.answer("Faqat son yozing, masalan: 12 yoki 2.5")
@@ -702,168 +762,165 @@ async def worker_log_used(m: Message, state: FSMContext):
         )
         return
     await state.update_data(used=used)
-    await state.set_state(LogWork.qty)
-    await m.answer("Nechta (dona) qildingiz? (oylik shu songa qarab hisoblanadi)")
+    await next_step(m, state, "material")
 
 
-@router.message(LogWork.qty, F.text)
-async def worker_log_qty(m: Message, state: FSMContext):
-    qty, _ = parse_qty(m.text)
-    if qty is None or qty <= 0:
-        await m.answer("Faqat son yozing, masalan: 20")
-        return
-    wid = await get_worker_id(m.from_user.id)
-    data = await state.get_data()
-    t = await db_one("SELECT id, name, price FROM work_types WHERE id=?", (data.get("tid"),))
-    p = None
-    if data.get("pid"):
-        p = await db_one("SELECT id, name, quantity, unit FROM products WHERE id=?", (data["pid"],))
-    if not wid or not t:
-        await state.clear()
-        await m.answer("Xatolik: qaytadan urinib ko'ring.")
-        return
-    used = float(data.get("used") or 0) if p else 0.0
-    if not await save_log(wid, t, p, qty, used):
-        await state.clear()
-        await m.answer("⚠️ Omborda material yetarli emas (qoldiq o'zgargan). Qaytadan kiriting.")
-        return
-    await state.clear()
-    total = await unpaid_total(wid)
-    what = f"{t['name']} — {p['name']}" if p else t["name"]
-    text = f"✅ {what}: {fmt(qty)} ta × {money(t['price'])} = {money(qty * t['price'])} so'm"
-    if used and p:
-        text += f"\n🧵 Ombordan ayrildi: {fmt(used)} {p['unit']} (qoldi: {fmt(p['quantity'] - used)} {p['unit']})"
-    text += f"\n💰 Joriy hisob: {money(total)} so'm"
-    await m.answer(text)
-
-
-# ---------------- tikish: tayyor mahsulot yaratish
-@router.message(MakeWork.what, F.text)
-async def make_what(m: Message, state: FSMContext):
+@router.message(Work.what, F.text)
+async def work_what(m: Message, state: FSMContext):
     what = m.text.strip()
     if not what or len(what) > 40:
         await m.answer("Qisqa nom yozing, masalan: postel")
         return
     await state.update_data(what=what)
-    await state.set_state(MakeWork.size)
-    kb = [[btn("1 kishilik", "mksize:1"), btn("2 kishilik", "mksize:2")]]
-    await m.answer(f"«{what}» necha kishilik?", reply_markup=markup(kb))
+    await next_step(m, state, "what")
 
 
-async def make_size_done(msg: Message, state: FSMContext, size: str):
-    what = (await state.get_data())["what"]
-    await state.update_data(size=size)
-    await state.set_state(MakeWork.name)
-    await msg.answer(f"{what.capitalize()} ({size} kishilik) — nomini yozing (masalan: Anor):")
+@router.callback_query(Work.size, F.data.startswith("mksize:"))
+async def work_size(c: CallbackQuery, state: FSMContext):
+    await state.update_data(size=c.data.split(":")[1])
+    await next_step(c, state, "size")
 
 
-@router.callback_query(MakeWork.size, F.data.startswith("mksize:"))
-async def make_size(c: CallbackQuery, state: FSMContext):
-    await make_size_done(c.message, state, c.data.split(":")[1])
-    await c.answer()
-
-
-@router.message(MakeWork.size, F.text)
-async def make_size_text(m: Message, state: FSMContext):
+@router.message(Work.size, F.text)
+async def work_size_text(m: Message, state: FSMContext):
     if m.text.strip() in ("1", "2"):
-        await make_size_done(m, state, m.text.strip())
+        await state.update_data(size=m.text.strip())
+        await next_step(m, state, "size")
     else:
         await m.answer("Tugmalardan birini tanlang: 1 yoki 2 kishilik.")
 
 
-@router.message(MakeWork.name, F.text)
-async def make_name(m: Message, state: FSMContext):
+@router.message(Work.name, F.text)
+async def work_name(m: Message, state: FSMContext):
     name = m.text.strip()
     if not name or len(name) > 60:
         await m.answer("Qisqa nom yozing, masalan: Anor")
         return
     await state.update_data(name=name)
-    await state.set_state(MakeWork.qty)
-    await m.answer("Nechta (dona) tikdingiz?")
+    await next_step(m, state, "name")
 
 
-@router.message(MakeWork.qty, F.text)
-async def make_qty(m: Message, state: FSMContext):
+@router.message(Work.qty, F.text)
+async def work_qty(m: Message, state: FSMContext):
     qty, _ = parse_qty(m.text)
     if qty is None or qty <= 0:
-        await m.answer("Faqat son yozing, masalan: 5")
+        await m.answer("Faqat son yozing, masalan: 20")
         return
     await state.update_data(qty=qty)
-    await state.set_state(MakeWork.photo)
-    kb = [[btn("⏭ Rasmsiz davom etish", "mkskip")]]
-    await m.answer("📷 Tayyor mahsulot rasmini yuboring (majburiy emas):", reply_markup=markup(kb))
+    await next_step(m, state, "qty")
 
 
-async def finish_make(msg: Message, state: FSMContext, tg_id: int, photo):
+@router.message(Work.photo, F.photo)
+async def work_photo(m: Message, state: FSMContext):
+    await state.update_data(photo=m.photo[-1].file_id)
+    await finish_work(m, state)
+
+
+@router.callback_query(Work.photo, F.data == "mkskip")
+async def work_photo_skip(c: CallbackQuery, state: FSMContext):
+    await finish_work(c.message, state)
+    await c.answer()
+
+
+@router.message(Work.photo)
+async def work_photo_hint(m: Message):
+    await m.answer("Rasm yuboring (siqilgan rasm sifatida) yoki «Rasmsiz davom etish» tugmasini bosing.")
+
+
+async def finish_work(msg: Message, state: FSMContext):
     d = await state.get_data()
-    wid = await get_worker_id(tg_id)
+    wid = d.get("wid")
     t = await db_one("SELECT id, name, price FROM work_types WHERE id=?", (d.get("tid"),))
-    if not wid or not t:
+    if not wid or not t or not d.get("qty"):
         await state.clear()
         await msg.answer("Xatolik: qaytadan urinib ko'ring.")
         return
-    what, size, qty = d["what"], d["size"], float(d["qty"])
-    name = d["name"].strip()[:1].upper() + d["name"].strip()[1:]
-    base = what.strip()[:1].upper() + what.strip()[1:]
-    pname = f"{name} ({size} kishilik)"
+    qty, photo = float(d["qty"]), d.get("photo")
+    used = float(d.get("used") or 0)
+    mat = None
+    if d.get("pid"):
+        mat = await db_one("SELECT id, name, quantity, unit FROM products WHERE id=?", (d["pid"],))
+    made = bool(d.get("what")) and "what" in d["fields"]
+    pname = cat_title = made_pid = None
+    need_price = False
+    now = datetime.now(TZ)
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
-        cats = await (await db.execute("SELECT id, name, unit FROM categories")).fetchall()
-        cat_id = cat_title = None
-        for cand in (base, f"{base} (tayyor)", "Tayyor mahsulotlar"):  # bo'lim bor bo'lsa shunga, yo'q bo'lsa yangi
-            ex = next((c for c in cats if c["name"].casefold() == cand.casefold()), None)
-            if ex is None:
-                cur = await db.execute("INSERT INTO categories(name, unit) VALUES(?, 'dona')", (cand,))
-                cat_id, cat_title = cur.lastrowid, cand
-                break
-            if ex["unit"] == "dona" or cand == "Tayyor mahsulotlar":
-                cat_id, cat_title = ex["id"], ex["name"]
-                break
-        prods = await (
-            await db.execute(
-                "SELECT id, name, price FROM products WHERE category_id=?", (cat_id,)
-            )
-        ).fetchall()
-        ex = next((p for p in prods if p["name"].casefold() == pname.casefold()), None)
-        if ex:
-            pid = ex["id"]
-            pname = ex["name"]  # hisobotda bir xil nom chiqishi uchun
-            await db.execute(
-                "UPDATE products SET quantity=quantity+?, photo=COALESCE(photo, ?) WHERE id=?", (qty, photo, pid)
-            )
-            need_price = not (ex["price"] or 0)
-            if need_price:
-                await db.execute("UPDATE products SET pending=1 WHERE id=?", (pid,))
-        else:
+        if used and mat:  # materialni ombordan ayirish
             cur = await db.execute(
-                "INSERT INTO products(category_id, name, quantity, unit, price, photo, pending, made_by) "
-                "VALUES(?,?,?,?,0,?,1,?)",
-                (cat_id, pname, qty, "dona", photo, wid),
+                "UPDATE products SET quantity=quantity-? WHERE id=? AND quantity>=?", (used, mat["id"], used)
             )
-            pid, need_price = cur.lastrowid, True
-        now = datetime.now(TZ)
+            if cur.rowcount == 0:
+                await state.clear()
+                await msg.answer("⚠️ Omborda material yetarli emas (qoldiq o'zgargan). Qaytadan kiriting.")
+                return
+        if made:  # tayyor mahsulot: bo'lim bor bo'lsa shunga, yo'q bo'lsa yangi bo'lim
+            what = d["what"].strip()
+            base = what[:1].upper() + what[1:]
+            nm = (d.get("name") or "").strip()
+            nm = (nm[:1].upper() + nm[1:]) if nm else base
+            pname = f"{nm} ({d['size']} kishilik)" if d.get("size") else nm
+            cats = await (await db.execute("SELECT id, name, unit FROM categories")).fetchall()
+            cat_id = None
+            for cand in (base, f"{base} (tayyor)", "Tayyor mahsulotlar"):
+                ex = next((c for c in cats if c["name"].casefold() == cand.casefold()), None)
+                if ex is None:
+                    cur = await db.execute("INSERT INTO categories(name, unit) VALUES(?, 'dona')", (cand,))
+                    cat_id, cat_title = cur.lastrowid, cand
+                    break
+                if ex["unit"] == "dona" or cand == "Tayyor mahsulotlar":
+                    cat_id, cat_title = ex["id"], ex["name"]
+                    break
+            prods = await (
+                await db.execute("SELECT id, name, price FROM products WHERE category_id=?", (cat_id,))
+            ).fetchall()
+            ex = next((p for p in prods if p["name"].casefold() == pname.casefold()), None)
+            if ex:
+                made_pid, pname = ex["id"], ex["name"]
+                await db.execute(
+                    "UPDATE products SET quantity=quantity+?, photo=COALESCE(photo, ?) WHERE id=?",
+                    (qty, photo, made_pid),
+                )
+                need_price = not (ex["price"] or 0)
+                if need_price:
+                    await db.execute("UPDATE products SET pending=1 WHERE id=?", (made_pid,))
+            else:
+                cur = await db.execute(
+                    "INSERT INTO products(category_id, name, quantity, unit, price, photo, pending, made_by) "
+                    "VALUES(?,?,?,?,0,?,1,?)",
+                    (cat_id, pname, qty, "dona", photo, wid),
+                )
+                made_pid, need_price = cur.lastrowid, True
         await db.execute(
-            "INSERT INTO work_logs(worker_id, work_type_id, work_name, product_id, product_name, qty, price, "
-            "day, month, used, used_unit, made_product_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (wid, t["id"], t["name"], None, pname, qty, t["price"], now.strftime("%Y-%m-%d"),
-             now.strftime("%Y-%m"), 0, None, pid),
+            "INSERT INTO work_logs(worker_id, work_type_id, work_name, product_id, product_name, material_name, "
+            "qty, price, day, month, used, used_unit, made_product_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                wid, t["id"], t["name"], mat["id"] if mat else None, pname or (mat["name"] if mat else None),
+                mat["name"] if mat else None, qty, t["price"], now.strftime("%Y-%m-%d"), now.strftime("%Y-%m"),
+                used if (used and mat) else 0, mat["unit"] if (used and mat) else None, made_pid,
+            ),
         )
         await db.commit()
     await state.clear()
     total = await unpaid_total(wid)
-    text = (
-        f"✅ {t['name']}: {cat_title} «{pname}» × {fmt(qty)} dona\n"
-        f"💰 {fmt(qty)} × {money(t['price'])} = {money(qty * t['price'])} so'm\n"
-    )
+    if made:
+        lines = [f"✅ {t['name']}: {cat_title} «{pname}» × {fmt(qty)} dona"]
+    elif mat:
+        lines = [f"✅ {t['name']} — {mat['name']}: {fmt(qty)} ta"]
+    else:
+        lines = [f"✅ {t['name']}: {fmt(qty)} ta"]
+    lines.append(f"💰 {fmt(qty)} × {money(t['price'])} = {money(qty * t['price'])} so'm")
+    if used and mat:
+        lines.append(f"🧵 Ombordan ayrildi: {fmt(used)} {mat['unit']} (qoldi: {fmt(mat['quantity'] - used)} {mat['unit']})")
     if need_price:
-        text += "📤 Menejerga yuborildi, narxini u qo'yadi.\n"
-    text += f"💰 Joriy hisob: {money(total)} so'm"
-    await msg.answer(text)
+        lines.append("📤 Menejerga yuborildi, narxini u qo'yadi.")
+    lines.append(f"💰 Joriy hisob: {money(total)} so'm")
+    await msg.answer("\n".join(lines))
     if need_price:  # menejerga xabar: narx qo'yish uchun
         w = await db_one("SELECT name FROM workers WHERE id=?", (wid,))
         note = f"🆕 {w['name']} tikdi: {cat_title} «{pname}» — {fmt(qty)} dona.\nNarxi hali qo'yilmagan."
-        kb = markup([[btn("💲 Narx qo'yish", f"setprice:{pid}")]])
-        photo_id = photo or (await db_one("SELECT photo FROM products WHERE id=?", (pid,)))["photo"]
+        kb = markup([[btn("💲 Narx qo'yish", f"setprice:{made_pid}")]])
+        photo_id = (await db_one("SELECT photo FROM products WHERE id=?", (made_pid,)))["photo"]
         for r in await db_all("SELECT tg_id FROM users WHERE role='manager'"):
             try:
                 if photo_id:
@@ -872,22 +929,6 @@ async def finish_make(msg: Message, state: FSMContext, tg_id: int, photo):
                     await msg.bot.send_message(r["tg_id"], note, reply_markup=kb)
             except Exception:
                 logging.exception("Menejerga xabar yuborilmadi")
-
-
-@router.message(MakeWork.photo, F.photo)
-async def make_photo(m: Message, state: FSMContext):
-    await finish_make(m, state, m.from_user.id, m.photo[-1].file_id)
-
-
-@router.callback_query(MakeWork.photo, F.data == "mkskip")
-async def make_skip(c: CallbackQuery, state: FSMContext):
-    await finish_make(c.message, state, c.from_user.id, None)
-    await c.answer()
-
-
-@router.message(MakeWork.photo)
-async def make_photo_hint(m: Message):
-    await m.answer("Rasm yuboring (siqilgan rasm sifatida) yoki «Rasmsiz davom etish» tugmasini bosing.")
 
 
 # ---------------- ishchi: oylik va bekor qilish
@@ -1208,21 +1249,33 @@ async def add_worker_name(m: Message, state: FSMContext):
 
 
 # --- ish turlari va narxlari
-KIND_ICON = {"cut": "✂️", "make": "🪡", "simple": "🔢"}
-KIND_LABEL = {
-    "cut": "✂️ Material ketadi (masalan: bichish)",
-    "make": "🪡 Tayyor mahsulot chiqadi (masalan: tikish)",
-    "simple": "🔢 Oddiy (faqat soni)",
-}
-KIND_ORDER = ["cut", "make", "simple"]
+FIELD_TEXT = (
+    "Ishchi bu ishni kiritganda nimalarni so'raylik?\n"
+    "(Nechta qilganini doim so'raymiz.)\n\n"
+    "• Material: ombordagi materialni tanlab, necha metr ketganini yozadi, shuncha ombordan ayriladi.\n"
+    "• Nima tayyorlandi: tayyor mahsulot yangi bo'limga tushadi, narxini siz qo'yasiz. "
+    "Kishilik, nom va rasm shu bilan birga ishlaydi.\n\n"
+    "Kerakli bandlarni belgilab, «Tayyor» ni bosing:"
+)
+
+
+def fields_kb(fields):
+    rows = [[btn(("☑️ " if k in fields else "⬜ ") + label, f"wtf:{k}")] for k, label in FIELD_LABELS]
+    rows.append([btn("✅ Tayyor", "wtfdone")])
+    return markup(rows)
+
+
+def fields_summary(fields):
+    asked = [label for k, label in FIELD_LABELS if k in fields] + ["🔢 Nechta qilgani (doim)"]
+    return "\n".join("• " + a for a in asked)
 
 
 async def types_view():
-    rows = await db_all("SELECT id, name, price, kind FROM work_types ORDER BY name")
-    kb = [
-        [btn(f"{KIND_ICON.get(r['kind'] or 'cut', '✂️')} {r['name']} — {money(r['price'])} so'm", f"wtd:{r['id']}")]
-        for r in rows
-    ]
+    rows = await db_all("SELECT id, name, price, kind, fields FROM work_types ORDER BY name")
+    kb = []
+    for r in rows:
+        icons = "".join(FIELD_ICON[f] for f in parse_fields(r["fields"], r["kind"]))
+        kb.append([btn(f"{r['name']} — {money(r['price'])} so'm {icons}".strip(), f"wtd:{r['id']}")])
     kb.append([btn("➕ Ish turi qo'shish", "wtadd")])
     kb.append([btn("⬅️ Orqaga", "wmenu")])
     text = "🛠 Ish turlari (narx 1 dona uchun):" if rows else "Hozircha ish turlari yo'q. Masalan: Bichish, Tikish."
@@ -1259,46 +1312,54 @@ async def work_type_price(m: Message, state: FSMContext):
     if price is None:
         await m.answer("Narxni raqam bilan yozing, masalan: 5000")
         return
-    await state.update_data(price=price)
-    await state.set_state(AddWorkType.kind)
-    kb = [[btn(KIND_LABEL[k], f"wtkind:{k}")] for k in KIND_ORDER]
-    await m.answer(
-        "Bu ish qanday?\n\n"
-        "• Material ketadi: ishchi materialni tanlab, necha metr ketganini yozadi (ombordan ayriladi).\n"
-        "• Tayyor mahsulot chiqadi: ishchi nima tikkanini yozadi (postel, necha kishilik, nomi, rasmi) va u "
-        "yangi bo'limga tushadi, narxini siz qo'yasiz.\n"
-        "• Oddiy: faqat nechta qilgani yoziladi.",
-        reply_markup=markup(kb),
-    )
+    await state.update_data(price=price, mode="add", fields=[])
+    await state.set_state(WTFields.pick)
+    await m.answer(FIELD_TEXT, reply_markup=fields_kb([]))
 
 
-@router.callback_query(RoleFilter("manager"), AddWorkType.kind, F.data.startswith("wtkind:"))
-async def work_type_kind(c: CallbackQuery, state: FSMContext):
-    kind = c.data.split(":")[1]
-    if kind not in KIND_LABEL:
+@router.callback_query(RoleFilter("manager"), WTFields.pick, F.data.startswith("wtf:"))
+async def work_type_toggle(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":")[1]
+    if key not in FIELD_ORDER:
         return await c.answer()
     d = await state.get_data()
-    await db_exec("INSERT INTO work_types(name, price, kind) VALUES(?,?,?)", (d["name"], d["price"], kind))
+    fields = toggle_field(d.get("fields", []), key)
+    await state.update_data(fields=fields)
+    await edit(c, FIELD_TEXT, fields_kb(fields))
+
+
+@router.callback_query(RoleFilter("manager"), WTFields.pick, F.data == "wtfdone")
+async def work_type_fields_done(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    fields = d.get("fields", [])
+    csv = ",".join(fields)
+    if d.get("mode") == "edit":
+        await db_exec("UPDATE work_types SET fields=? WHERE id=?", (csv, d["tid"]))
+        await state.clear()
+        text, kb = await work_type_card(d["tid"])
+        await edit(c, "✅ Saqlandi.\n\n" + text, kb)
+        return
+    await db_exec(
+        "INSERT INTO work_types(name, price, kind, fields) VALUES(?,?,?,?)", (d["name"], d["price"], "custom", csv)
+    )
     await state.clear()
     text, kb = await types_view()
-    await edit(c, f"✅ «{d['name']}» — {money(d['price'])} so'm ({KIND_LABEL[kind]}).\n\n{text}", kb)
-
-
-@router.message(AddWorkType.kind)
-async def work_type_kind_hint(m: Message):
-    await m.answer("Tugmalardan birini tanlang.")
+    await edit(c, f"✅ «{d['name']}» — {money(d['price'])} so'm.\nIshchidan so'raladi:\n{fields_summary(fields)}\n\n{text}", kb)
 
 
 async def work_type_card(tid: int):
-    t = await db_one("SELECT id, name, price, kind FROM work_types WHERE id=?", (tid,))
+    t = await db_one("SELECT id, name, price, kind, fields FROM work_types WHERE id=?", (tid,))
     if not t:
         return None, None
     kb = [
-        [btn("💲 Narxni o'zgartirish", f"wtprice:{tid}"), btn("🔁 Turini almashtirish", f"wtkc:{tid}")],
+        [btn("💲 Narxni o'zgartirish", f"wtprice:{tid}"), btn("✏️ So'raladigan ma'lumotlar", f"wtfe:{tid}")],
         [btn("🗑 O'chirish", f"wtdel:{tid}")],
         [btn("⬅️ Orqaga", "wtypes")],
     ]
-    text = f"🛠 {t['name']}\n💰 1 dona: {money(t['price'])} so'm\n📌 Turi: {KIND_LABEL.get(t['kind'] or 'cut')}"
+    text = (
+        f"🛠 {t['name']}\n💰 1 dona: {money(t['price'])} so'm\n\n"
+        f"📋 Ishchidan so'raladi:\n{fields_summary(parse_fields(t['fields'], t['kind']))}"
+    )
     return text, markup(kb)
 
 
@@ -1310,17 +1371,17 @@ async def work_type_detail(c: CallbackQuery):
     await edit(c, text, kb)
 
 
-@router.callback_query(RoleFilter("manager"), F.data.startswith("wtkc:"))
-async def work_type_kind_cycle(c: CallbackQuery):
+@router.callback_query(RoleFilter("manager"), F.data.startswith("wtfe:"))
+async def work_type_fields_edit(c: CallbackQuery, state: FSMContext):
     tid = int(c.data.split(":")[1])
-    t = await db_one("SELECT kind FROM work_types WHERE id=?", (tid,))
+    t = await db_one("SELECT id, kind, fields FROM work_types WHERE id=?", (tid,))
     if not t:
         return await c.answer("Topilmadi", show_alert=True)
-    cur = t["kind"] if t["kind"] in KIND_ORDER else "cut"
-    new = KIND_ORDER[(KIND_ORDER.index(cur) + 1) % len(KIND_ORDER)]
-    await db_exec("UPDATE work_types SET kind=? WHERE id=?", (new, tid))
-    text, kb = await work_type_card(tid)
-    await edit(c, text, kb)
+    fields = parse_fields(t["fields"], t["kind"])
+    await state.clear()
+    await state.set_state(WTFields.pick)
+    await state.update_data(mode="edit", tid=tid, fields=fields)
+    await edit(c, FIELD_TEXT, fields_kb(fields))
 
 
 @router.callback_query(RoleFilter("manager"), F.data == "wpend")
