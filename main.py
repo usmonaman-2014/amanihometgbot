@@ -18,6 +18,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiosqlite
+from api import start_api
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import BaseFilter, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -986,6 +987,7 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
     bot = Bot(BOT_TOKEN)
+    await start_api(bot, db_all, db_one, db_exec, get_setting, parse_sale)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await dp.start_polling(bot)
