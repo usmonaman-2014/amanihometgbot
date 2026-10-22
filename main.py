@@ -34,7 +34,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-BOT_TOKEN = "8449631689:AAH4NNzGUufV044kWJBhxMlKgODgb03Uyww"
+BOT_TOKEN = "8935136379:AAE2W8KPvieAUQ9vvWMQ7s0oxw87kLmFnbc"
 DB = os.getenv("DB_PATH", "shop.db")
 TZ = ZoneInfo("Asia/Tashkent")
 AI_MODEL = "claude-haiku-4-5-20251001"
